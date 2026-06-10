@@ -1,0 +1,4 @@
+[build]
+  base = "orbital-debris"
+  command = "npm run build"
+  publish = ".next"
