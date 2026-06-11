@@ -27,6 +27,7 @@ import json
 import math
 import os
 import time
+from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
@@ -47,20 +48,29 @@ SPACETRACK_BASE     = "https://www.space-track.org"
 EARTH_RADIUS_KM     = 6371.0
 MU                  = 398600.4418          # km³/s²
 
-app = FastAPI(title="NEXUS Orbital Debris API", version="2.4.1")
+# CORS origins
+allowed_origins_env = os.getenv("ALLOWED_ORIGINS")
+if allowed_origins_env:
+    allow_origins = [origin.strip() for origin in allowed_origins_env.split(",") if origin.strip()]
+else:
+    allow_origins = ["http://localhost:3000", "https://your-domain.com", "http://127.0.0.1:3000"]
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:3000", "https://your-domain.com"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-@app.on_event("startup")
-async def startup_event():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     try:
         await fetch_tle(limit=500)
     except Exception:
         pass
+    yield
+
+app = FastAPI(title="NEXUS Orbital Debris API", version="2.4.1", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allow_origins,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 # ─── Data Models ─────────────────────────────────────────────────────────
@@ -220,12 +230,12 @@ async def fetch_tle_from_spacetrack(
             if lines[i + 1].startswith("1 ") and lines[i + 2].startswith("2 "):
                 result.append((lines[i], lines[i + 1], lines[i + 2]))
         return result
-
-
 def _jday_now(dt: datetime | None = None) -> tuple[float, float]:
     """Return (jd, fr) for sgp4."""
     if dt is None:
         dt = datetime.now(timezone.utc)
+    elif dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc)
     jd, fr = jday(dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second + dt.microsecond / 1e6)
     return jd, fr
 
@@ -244,6 +254,9 @@ def propagate_tle(name: str, line1: str, line2: str, dt: datetime | None = None)
 
         x, y, z   = r  # ECI km
         vx, vy, vz = v  # km/s
+
+        if math.isnan(x) or math.isnan(y) or math.isnan(z) or math.isnan(vx) or math.isnan(vy) or math.isnan(vz):
+            return None
 
         alt = math.sqrt(x**2 + y**2 + z**2) - EARTH_RADIUS_KM
 
@@ -282,7 +295,9 @@ def ml_conjunction_probability(
     Simplified Chan formula approximation for collision probability.
     In production: replace with a trained PyTorch/TensorFlow model.
     """
-    sigma = 0.2 * max(miss_km, 0.01)    # combined hard-body radius + uncertainty
+    # Fix bug: using linear scaling of sigma to miss_km made probability a constant math.exp(-12.5).
+    # We now use a standard combined tracking uncertainty sigma (e.g. 0.2 km scaled by combined_rcs).
+    sigma = 0.2 * combined_rcs
     prob  = math.exp(-(miss_km ** 2) / (2 * sigma ** 2))
     prob *= min(1.0, rel_vel_kms / 15.0)  # higher vel = higher energy
     return round(min(prob, 0.9999), 6)
@@ -422,6 +437,7 @@ async def health():
 async def fetch_tle(limit: int = Query(500, le=2000)):
     """Pull and cache TLE data from Space-Track.org."""
     global _cache_time
+    source = "cache"
 
     if _cache_is_stale() or not _tle_cache:
         try:
@@ -440,8 +456,34 @@ async def fetch_tle(limit: int = Query(500, le=2000)):
     return {
         "count": len(_tle_cache),
         "cached_at": datetime.fromtimestamp(_cache_time, tz=timezone.utc).isoformat(),
-        "source": source if 'source' in locals() else "cache",
+        "source": source,
     }
+
+
+def propagate_all_tle_dict(tle_items: list[tuple[int, tuple[str, str, str]]], dt: datetime) -> list[dict]:
+    """Helper to propagate a list of TLEs to dt in a thread pool, returning custom format dict."""
+    updates = []
+    for norad_id, (name, l1, l2) in tle_items:
+        state = propagate_tle(name, l1, l2, dt)
+        if state:
+            updates.append({
+                "id":    f"debris-{norad_id}",
+                "x":     state.x,
+                "y":     state.y,
+                "z":     state.z,
+                "threat": state.threat_level,
+            })
+    return updates
+
+
+def propagate_debris_list_asdict(tle_items: list[tuple[int, tuple[str, str, str]]], dt: datetime) -> list[dict]:
+    """Helper to propagate a list of TLEs to dt in a thread pool, returning asdict(state) format."""
+    results = []
+    for norad_id, (name, l1, l2) in tle_items:
+        state = propagate_tle(name, l1, l2, dt)
+        if state:
+            results.append(asdict(state))
+    return results
 
 
 @app.get("/api/debris")
@@ -452,11 +494,8 @@ async def get_debris(limit: int = Query(2700, le=5000)):
         return {"objects": [], "source": "cache_empty", "count": 0}
 
     now = datetime.now(timezone.utc)
-    results = []
-    for norad_id, (name, l1, l2) in list(_tle_cache.items())[:limit]:
-        state = propagate_tle(name, l1, l2, now)
-        if state:
-            results.append(asdict(state))
+    tle_items = list(_tle_cache.items())[:limit]
+    results = await asyncio.to_thread(propagate_debris_list_asdict, tle_items, now)
 
     return {"objects": results, "count": len(results), "epoch": now.isoformat()}
 
@@ -468,11 +507,8 @@ async def simulate(req: SimulateRequest):
         raise HTTPException(400, "TLE cache empty — call /api/tle/fetch first")
 
     future_dt = datetime.now(timezone.utc) + timedelta(hours=req.hours_ahead)
-    results = []
-    for norad_id, (name, l1, l2) in list(_tle_cache.items())[:2700]:
-        state = propagate_tle(name, l1, l2, future_dt)
-        if state:
-            results.append(asdict(state))
+    tle_items = list(_tle_cache.items())[:2700]
+    results = await asyncio.to_thread(propagate_debris_list_asdict, tle_items, future_dt)
 
     return {
         "objects": results,
@@ -520,16 +556,14 @@ async def recommend_maneuver(req: ManeuverRequest):
 
 class ConnectionManager:
     def __init__(self):
-        self.active: list[WebSocket] = []
+        self.active: set[WebSocket] = set()
 
     async def connect(self, ws: WebSocket):
         await ws.accept()
-        self.active.append(ws)
+        self.active.add(ws)
 
     def disconnect(self, ws: WebSocket):
-        self.active.discard(ws) if hasattr(self.active, 'discard') else None
-        if ws in self.active:
-            self.active.remove(ws)
+        self.active.discard(ws)
 
     async def broadcast(self, data: dict):
         disconnected = []
@@ -573,21 +607,15 @@ async def websocket_debris(websocket: WebSocket):
                     update_interval = max(0.1, 2.0 / msg.get("speed", 1))
             except asyncio.TimeoutError:
                 pass
+            except json.JSONDecodeError:
+                # Log or ignore invalid payload format and keep connection alive
+                pass
 
             # Propagate and stream positions
             if _tle_cache:
                 sim_dt = datetime.now(timezone.utc) + timedelta(hours=sim_time_offset_hours)
-                updates = []
-                for norad_id, (name, l1, l2) in list(_tle_cache.items())[:2700]:
-                    state = propagate_tle(name, l1, l2, sim_dt)
-                    if state:
-                        updates.append({
-                            "id":    f"debris-{norad_id}",
-                            "x":     state.x,
-                            "y":     state.y,
-                            "z":     state.z,
-                            "threat": state.threat_level,
-                        })
+                tle_items = list(_tle_cache.items())[:2700]
+                updates = await asyncio.to_thread(propagate_all_tle_dict, tle_items, sim_dt)
                 await websocket.send_json({"type": "debris_update", "payload": updates})
             else:
                 # Ping to keep connection alive while cache is empty
@@ -595,5 +623,7 @@ async def websocket_debris(websocket: WebSocket):
 
             await asyncio.sleep(update_interval)
 
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, Exception):
+        pass
+    finally:
         manager.disconnect(websocket)

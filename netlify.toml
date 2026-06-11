@@ -1,4 +1,4 @@
 [build]
-  base = "orbital-debris"
+  base = "frontend"
   command = "npm run build"
   publish = ".next"
